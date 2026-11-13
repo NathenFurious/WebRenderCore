@@ -4,6 +4,10 @@
 
 #include "third_party/blink/renderer/core/css/parser/css_tokenizer.h"
 
+#include <array>
+#include <cstring>
+#include <string_view>
+
 #include "base/compiler_specific.h"
 #include "third_party/blink/renderer/core/css/parser/css_parser_idioms.h"
 #include "third_party/blink/renderer/core/css/parser/css_property_parser.h"
@@ -11,13 +15,29 @@
 #include "third_party/blink/renderer/core/html/parser/input_stream_preprocessor.h"
 #include "third_party/blink/renderer/platform/wtf/text/character_names.h"
 
-#ifdef __SSE2__
-#include <immintrin.h>
-#elif defined(__ARM_NEON__)
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#elif defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 
 namespace blink {
+
+namespace {
+
+// Name code points for 8-bit strings: [A-Za-z0-9_-] plus all non-ASCII
+// (bytes >= 0x80). Matches IsNameCodePoint() for LChar input.
+constexpr std::array<bool, 256> MakeNameByteTable() {
+  std::array<bool, 256> t{};
+  for (int c = 0; c < 256; ++c) {
+    t[c] = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '-' || c >= 0x80;
+  }
+  return t;
+}
+constexpr std::array<bool, 256> kNameByte = MakeNameByteTable();
+
+}  // namespace
 
 CSSTokenizer::CSSTokenizer(StringView string, wtf_size_t offset)
     : input_(string) {
@@ -544,7 +564,19 @@ void CSSTokenizer::ConsumeSingleWhitespaceIfNext() {
   blink::ConsumeSingleWhitespaceIfNext(input_);
 }
 
+// Skips to just past the closing "*/" (the opening "/*" is already consumed).
+// An unterminated comment runs to the end of the input, as the spec requires.
 void CSSTokenizer::ConsumeUntilCommentEndFound() {
+  StringView rest = input_.Peek();
+  if (rest.Is8Bit()) {
+    base::span<const LChar> s = rest.Span8();
+    std::string_view sv(reinterpret_cast<const char*>(s.data()), s.size());
+    size_t pos = sv.find("*/");
+    input_.Advance(pos == std::string_view::npos ? s.size() : pos + 2);
+    return;
+  }
+
+  // 16-bit input: original character-at-a-time loop.
   UChar c = Consume();
   while (true) {
     if (c == kEndOfFileMarker) {
@@ -565,7 +597,7 @@ bool CSSTokenizer::ConsumeIfNext(UChar character) {
   // Since we're not doing replacement we can't tell the difference from
   // a NUL in the middle and the kEndOfFileMarker, so character must not be
   // NUL.
-  DCHECK(character);
+  CHECK(character);
   if (input_.PeekWithoutReplacement(0) == character) {
     input_.Advance();
     return true;
@@ -582,32 +614,31 @@ bool CSSTokenizer::ConsumeIfNext(UChar character) {
 // If not, we can send back the relevant substring of the input, without any
 // allocations.
 //
-// If SIMD is available (we support only SSE2 and NEON), we do this 16 and 16
-// bytes at a time, generally giving a speed boost except for very short names.
-// (We don't get short-circuiting, and we need some extra setup to load
-// constants, but we also don't get a lot of branches per byte that we
-// consider.)
+// If SIMD is available (we support only SSE2 and NEON), we skip 16 bytes at a
+// time for 8-bit strings, then let the scalar loop classify the first byte that
+// is not a name code point (and the last <= 15 bytes).
 //
 // The checking for \0 is a bit odd; \0 is sometimes used as an EOF marker
 // internal to this code, so we need to call into blink::ConsumeName()
 // to escape it (into a Unicode replacement character) if we should see it.
 StringView CSSTokenizer::ConsumeName() {
   StringView buffer = input_.Peek();
-
   unsigned size = 0;
-#if defined(__SSE2__) || defined(__ARM_NEON__)
+
   if (buffer.Is8Bit()) {
-    const LChar* ptr = buffer.Span8().data();
-    while (size + 16 <= buffer.length()) {
+    base::span<const LChar> s = buffer.Span8();
+
+#if defined(__SSE2__) || defined(__ARM_NEON)
+    while (size + 16 <= s.size()) {
       int8_t b __attribute__((vector_size(16)));
-      UNSAFE_BUFFERS(memcpy(&b, ptr + size, sizeof(b)));
+      memcpy(&b, s.subspan(size, 16).data(), sizeof(b));  // Bounds-checked.
 
       // Exactly the same as IsNameCodePoint(), except the IsAscii() part,
       // which we deal with below. Note that we compute the inverted condition,
       // since __builtin_ctz wants to find the first 1-bit, not the first 0-bit.
       auto non_name_mask = ((b | 0x20) < 'a' || (b | 0x20) > 'z') && b != '_' &&
                            b != '-' && (b < '0' || b > '9');
-#ifdef __SSE2__
+#if defined(__SSE2__)
       // pmovmskb extracts only the top bit and ignores the rest,
       // so to implement the IsAscii() test, which for LChar only
       // tests whether the top bit is set, we don't need a compare;
@@ -618,11 +649,8 @@ StringView CSSTokenizer::ConsumeName() {
         size += 16;
         continue;
       }
-
-      // We found either the end, or a sign that we need escape-aware parsing.
       size += __builtin_ctz(bits);
-#else  // __ARM_NEON__
-
+#else  // __ARM_NEON
       // NEON doesn't have pmovmskb, so we'll need to do the actual compare
       // (or something similar, like shifting). Now the mask is either all-zero
       // or all-one for each byte, so we can use the code from
@@ -635,24 +663,29 @@ StringView CSSTokenizer::ConsumeName() {
         size += 16;
         continue;
       }
-
-      // We found either the end, or a sign that we need escape-aware parsing.
       size += __builtin_ctzll(bits) >> 2;
 #endif
-      if (UNSAFE_BUFFERS(ptr[size]) == '\0' ||
-          UNSAFE_BUFFERS(ptr[size]) == '\\') {
-        // We need escape-aware parsing.
-        return RegisterString(blink::ConsumeName(input_));
-      } else {
-        input_.Advance(size);
-        return StringView(buffer, 0, size);
-      }
+      // `size` now points at the first non-name byte. The scalar loop below
+      // decides whether it needs escape-aware parsing or ends the name.
+      break;
     }
-    // Fall back to the slow path for the last <= 15 bytes of the string.
-  }
 #endif  // SIMD
 
-  // Slow path for non-UTF-8 and tokens near the end of the string.
+    for (; size < s.size(); ++size) {
+      LChar c = s[size];  // Bounds-checked.
+      if (!kNameByte[c]) {
+        if (c == '\0' || c == '\\') {
+          // We need escape-aware parsing.
+          return RegisterString(blink::ConsumeName(input_));
+        }
+        break;
+      }
+    }
+    input_.Advance(size);
+    return StringView(buffer, 0, size);
+  }
+
+  // 16-bit path: slow path for non-Latin-1 strings.
   for (; size < buffer.length(); ++size) {
     // SAFETY: size checked against length in loop condition.
     UChar cc = UNSAFE_BUFFERS(buffer[size]);
@@ -672,17 +705,14 @@ StringView CSSTokenizer::ConsumeName() {
       if (cc == '\0' || cc == '\\') {
         // We need escape-aware parsing.
         return RegisterString(blink::ConsumeName(input_));
-      } else {
-        // Names without escapes get handled without allocations
-        input_.Advance(size);
-        return StringView(buffer, 0, size);
       }
+      break;
     }
   }
 
-  // The entire rest of the string is a name.
+  // Names without escapes get handled without allocations.
   input_.Advance(size);
-  return buffer;
+  return StringView(buffer, 0, size);
 }
 
 // https://drafts.csswg.org/css-syntax/#consume-an-escaped-code-point
